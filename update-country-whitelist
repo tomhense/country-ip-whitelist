@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Fetch IPv4/IPv6 CIDR whitelists for selected countries and apply them
-as nftables sets, replacing a dynamic include file safely and atomically.
+as nftables sets, replacing a dynamic include file safely and atomically,
+with strict parsing/validation to prevent injection of malicious data.
 """
 
 import os
@@ -10,9 +11,14 @@ import logging
 import requests
 import tempfile
 import subprocess
+import ipaddress
 from pathlib import Path
 from textwrap import indent
 from typing import List, Tuple, Set
+
+# ----------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------
 
 COUNTRIES: List[str] = ["DE", "NL"]
 
@@ -29,11 +35,40 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
+# ----------------------------------------------------------------------
+# CIDR parsing
+# ----------------------------------------------------------------------
+
+def parse_cidr_lines(lines: List[str]) -> Tuple[Set[str], Set[str]]:
+    """
+    Parse text lines into validated IPv4 and IPv6 CIDR strings.
+    Any line that is not a valid network is ignored.
+    """
+    ipv4 = set()
+    ipv6 = set()
+    for lineno, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            net = ipaddress.ip_network(line, strict=False)
+        except ValueError:
+            logging.warning("Skipping invalid CIDR line %d: %r", lineno, line)
+            continue
+        if isinstance(net, ipaddress.IPv4Network):
+            ipv4.add(str(net))
+        else:
+            ipv6.add(str(net))
+    return ipv4, ipv6
+
+# ----------------------------------------------------------------------
+# Fetch and merge country whitelists safely
+# ----------------------------------------------------------------------
 
 def fetch_country_cidrs(fetch_timeout: int = FETCH_TIMEOUT) -> Tuple[List[str], List[str]]:
-    """Return (ipv4, ipv6) lists for all configured countries."""
-    ipv4: Set[str] = set()
-    ipv6: Set[str] = set()
+    """Return (ipv4, ipv6) lists for all configured countries, safely parsed."""
+    all_ipv4: Set[str] = set()
+    all_ipv6: Set[str] = set()
 
     session = requests.Session()
 
@@ -52,31 +87,29 @@ def fetch_country_cidrs(fetch_timeout: int = FETCH_TIMEOUT) -> Tuple[List[str], 
                 logging.warning("Failed to fetch %s: %s", url, e)
                 continue
 
-            for line in r.text.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                (ipv6 if ":" in line else ipv4).add(line)
+            ipv4_list, ipv6_list = parse_cidr_lines(r.text.splitlines())
+            all_ipv4 |= ipv4_list
+            all_ipv6 |= ipv6_list
 
-    logging.info("Fetched %d IPv4 and %d IPv6 CIDRs total.", len(ipv4), len(ipv6))
-    return sorted(ipv4), sorted(ipv6)
+    logging.info("Fetched %d IPv4 and %d IPv6 valid CIDRs total.", len(all_ipv4), len(all_ipv6))
+    return sorted(all_ipv4), sorted(all_ipv6)
 
+# ----------------------------------------------------------------------
+# Nftables file generation and validation
+# ----------------------------------------------------------------------
 
 def format_elements_block(cidr_list: List[str], base_indent: int = 8) -> str:
     """Return a nicely formatted nftables 'elements = { ... }' block."""
     if not cidr_list:
         return "elements = {}"
-
     cidr_indent = base_indent + 4
     inner = ",\n".join(cidr_list)
     return f"elements = {{\n{indent(inner, ' ' * cidr_indent)}\n{' ' * base_indent}}}"
-
 
 def generate_rule_file(ipv4: List[str], ipv6: List[str]) -> str:
     """Render the nftables include file directly in Python."""
     ipv4_block = format_elements_block(ipv4)
     ipv6_block = format_elements_block(ipv6)
-
     return f"""table inet whitelist {{
     set allowed_v4 {{
         type ipv4_addr
@@ -107,7 +140,6 @@ def generate_rule_file(ipv4: List[str], ipv6: List[str]) -> str:
     }}
 }}""".strip() + "\n"
 
-
 def validate_nftables(temp_path: Path) -> None:
     """Syntax-check the generated nftables rules."""
     logging.info("Testing nftables syntax...")
@@ -122,12 +154,14 @@ def validate_nftables(temp_path: Path) -> None:
         logging.error("nftables syntax check failed:\n%s", e.stderr)
         raise RuntimeError("nftables syntax validation failed") from e
 
-
 def apply_nftables() -> None:
     """Apply nftables configuration to the live system."""
     logging.info("Applying nftables configuration...")
     subprocess.run(["nft", "-f", "/etc/nftables.conf"], check=True)
 
+# ----------------------------------------------------------------------
+# Atomic file writing
+# ----------------------------------------------------------------------
 
 def write_atomic_file(content: str, directory: Path) -> Path:
     """Write content atomically to a file under directory and return its Path."""
@@ -138,6 +172,9 @@ def write_atomic_file(content: str, directory: Path) -> Path:
         temp_path = Path(tmp.name)
     return temp_path
 
+# ----------------------------------------------------------------------
+# Main entry point
+# ----------------------------------------------------------------------
 
 def main() -> int:
     try:
@@ -156,7 +193,6 @@ def main() -> int:
     except Exception as e:
         logging.exception("❌ Update failed: %s", e)
         return 1
-
 
 if __name__ == "__main__":
     sys.exit(main())
