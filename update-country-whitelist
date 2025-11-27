@@ -131,6 +131,10 @@ def generate_rule_file(ipv4: List[str], ipv6: List[str]) -> str:
         iifname "lo" accept
         ct state established,related accept
 
+        # Allow link-local and multicast IPv6 (RA, ND, DHCPv6, etc.)
+        ip6 saddr fe80::/10 accept comment "Allow link-local IPv6 (ND, RA)"
+        ip6 saddr ff00::/8 accept comment "Allow IPv6 multicast (ND, RA, DHCPv6)"
+
         # Allow whitelisted networks
         ip saddr @allowed_v4 accept
         ip6 saddr @allowed_v6 accept
