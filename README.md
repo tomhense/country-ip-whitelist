@@ -31,6 +31,13 @@ table inet filter {
 
         # Allow essential ports
         tcp dport { 80, 443, 22 } accept
+
+        # Allow ICMP
+        meta l4proto { icmp, ipv6-icmp } accept comment "Accept ICMP"
+        ip protocol igmp accept comment "Accept IGMP"
+
+        # Allow inbound DHCPv6 replies
+        ip6 nexthdr udp udp sport 547 udp dport 546 accept
     }
 }
 
