@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Fetch IPv4/IPv6 CIDR whitelists for selected countries and apply them
-as nftables sets, replacing a dynamic include file safely and atomically,
-with strict parsing/validation to prevent injection of malicious data.
+Fetch IPv4/IPv6 CIDR whitelists for selected countries, collapse overlapping
+subnets to optimize firewall memory/lookup performance, and batch load them
+safely into nftables using an A/B (Blue-Green) swap pattern to prevent
+Netlink buffer space errors and ensure zero network downtime.
 """
 
 import os
@@ -14,13 +15,13 @@ import subprocess
 import ipaddress
 from pathlib import Path
 from textwrap import indent
-from typing import List, Tuple, Set
+from typing import List, Tuple, Set, Generator
 
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
 
-COUNTRIES: List[str] = ["DE", "NL"]
+COUNTRIES: List[str] = ["DE"]
 
 BASE_URL: str = (
     "https://raw.githubusercontent.com/ebrasha/cidr-ip-ranges-by-country/refs/heads/master/CIDR"
@@ -28,6 +29,7 @@ BASE_URL: str = (
 
 DEST: Path = Path("/etc/nftables.d/whitelist.nft")
 FETCH_TIMEOUT: int = 20
+CHUNK_SIZE: int = 5000  # Number of elements loaded per transaction
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,12 +38,18 @@ logging.basicConfig(
 )
 
 # ----------------------------------------------------------------------
-# CIDR parsing
+# Helper Functions
 # ----------------------------------------------------------------------
 
-def parse_cidr_lines(lines: List[str]) -> Tuple[Set[str], Set[str]]:
+def chunk_list(lst: List[str], chunk_size: int) -> Generator[List[str], None, None]:
+    """Yield successive chunks from lst."""
+    for i in range(0, len(lst), chunk_size):
+        yield lst[i : i + chunk_size]
+
+
+def parse_cidr_lines(lines: List[str]) -> Tuple[Set[ipaddress.IPv4Network], Set[ipaddress.IPv6Network]]:
     """
-    Parse text lines into validated IPv4 and IPv6 CIDR strings.
+    Parse text lines into validated IPv4 and IPv6 network objects.
     Any line that is not a valid network is ignored.
     """
     ipv4 = set()
@@ -51,25 +59,22 @@ def parse_cidr_lines(lines: List[str]) -> Tuple[Set[str], Set[str]]:
         if not line or line.startswith("#"):
             continue
         try:
+            # strict=False automatically masks the host bits
             net = ipaddress.ip_network(line, strict=False)
         except ValueError:
             logging.warning("Skipping invalid CIDR line %d: %r", lineno, line)
             continue
         if isinstance(net, ipaddress.IPv4Network):
-            ipv4.add(str(net))
+            ipv4.add(net)
         else:
-            ipv6.add(str(net))
+            ipv6.add(net)
     return ipv4, ipv6
 
-# ----------------------------------------------------------------------
-# Fetch and merge country whitelists safely
-# ----------------------------------------------------------------------
 
-def fetch_country_cidrs(fetch_timeout: int = FETCH_TIMEOUT) -> Tuple[List[str], List[str]]:
-    """Return (ipv4, ipv6) lists for all configured countries, safely parsed."""
-    all_ipv4: Set[str] = set()
-    all_ipv6: Set[str] = set()
-
+def fetch_country_cidrs() -> Tuple[List[str], List[str]]:
+    """Return optimized (ipv4, ipv6) string lists for configured countries."""
+    all_ipv4: Set[ipaddress.IPv4Network] = set()
+    all_ipv6: Set[ipaddress.IPv6Network] = set()
     session = requests.Session()
 
     for cc in COUNTRIES:
@@ -81,21 +86,37 @@ def fetch_country_cidrs(fetch_timeout: int = FETCH_TIMEOUT) -> Tuple[List[str], 
             url = f"{BASE_URL}/{cc}-{family}-Hackers.Zone.txt"
             logging.info("Fetching %s %s list...", cc, family)
             try:
-                r = session.get(url, timeout=fetch_timeout)
+                r = session.get(url, timeout=FETCH_TIMEOUT)
                 r.raise_for_status()
             except requests.RequestException as e:
                 logging.warning("Failed to fetch %s: %s", url, e)
                 continue
 
-            ipv4_list, ipv6_list = parse_cidr_lines(r.text.splitlines())
-            all_ipv4 |= ipv4_list
-            all_ipv6 |= ipv6_list
+            ipv4_set, ipv6_set = parse_cidr_lines(r.text.splitlines())
+            all_ipv4 |= ipv4_set
+            all_ipv6 |= ipv6_set
 
-    logging.info("Fetched %d IPv4 and %d IPv6 valid CIDRs total.", len(all_ipv4), len(all_ipv6))
-    return sorted(all_ipv4), sorted(all_ipv6)
+    total_raw = len(all_ipv4) + len(all_ipv6)
+    logging.info("Fetched %d raw IPv4 and %d raw IPv6 CIDRs total.", len(all_ipv4), len(all_ipv6))
+
+    # Collapse contiguous and overlapping subnet blocks to optimize set size
+    collapsed_v4 = list(ipaddress.collapse_addresses(all_ipv4))
+    collapsed_v6 = list(ipaddress.collapse_addresses(all_ipv6))
+    total_collapsed = len(collapsed_v4) + len(collapsed_v6)
+
+    logging.info(
+        "Collapsed networks to %d IPv4 and %d IPv6 elements (reduced by %d entries).",
+        len(collapsed_v4),
+        len(collapsed_v6),
+        total_raw - total_collapsed,
+    )
+
+    # Convert back to sorted string representations for rules
+    return [str(net) for net in collapsed_v4], [str(net) for net in collapsed_v6]
+
 
 # ----------------------------------------------------------------------
-# Nftables file generation and validation
+# Nftables File Formatting
 # ----------------------------------------------------------------------
 
 def format_elements_block(cidr_list: List[str], base_indent: int = 8) -> str:
@@ -106,66 +127,91 @@ def format_elements_block(cidr_list: List[str], base_indent: int = 8) -> str:
     inner = ",\n".join(cidr_list)
     return f"elements = {{\n{indent(inner, ' ' * cidr_indent)}\n{' ' * base_indent}}}"
 
-def generate_rule_file(ipv4: List[str], ipv6: List[str]) -> str:
-    """Render the nftables include file directly in Python."""
-    ipv4_block = format_elements_block(ipv4)
-    ipv6_block = format_elements_block(ipv6)
-    return f"""table inet whitelist {{
-    set allowed_v4 {{
+
+def generate_whitelist_file(active: str, ipv4: List[str], ipv6: List[str]) -> str:
+    """Generate the full content of the persistent whitelist file."""
+    v4_a = ipv4 if active == "a" else []
+    v4_b = ipv4 if active == "b" else []
+    v6_a = ipv6 if active == "a" else []
+    v6_b = ipv6 if active == "b" else []
+
+    return f"""\
+# This file is auto-generated by update-country-whitelist. Do not edit manually.
+table inet filter {{
+    set allowed_v4_a {{
         type ipv4_addr
         flags interval
-        {ipv4_block}
+        {format_elements_block(v4_a)}
     }}
 
-    set allowed_v6 {{
+    set allowed_v6_a {{
         type ipv6_addr
         flags interval
-        {ipv6_block}
+        {format_elements_block(v6_a)}
     }}
 
-    chain input_filter {{
-        type filter hook input priority -10;
-        policy accept;
-
-        # Always allow loopback & established connections
-        iifname "lo" accept
-        ct state established,related accept
-
-        # Allow link-local and multicast IPv6 (RA, ND, DHCPv6, etc.)
-        ip6 saddr fe80::/10 accept comment "Allow link-local IPv6 (ND, RA)"
-        ip6 saddr ff00::/8 accept comment "Allow IPv6 multicast (ND, RA, DHCPv6)"
-
-        # Allow whitelisted networks
-        ip saddr @allowed_v4 accept
-        ip6 saddr @allowed_v6 accept
-
-        # Drop everything else
-        drop
+    set allowed_v4_b {{
+        type ipv4_addr
+        flags interval
+        {format_elements_block(v4_b)}
     }}
-}}""".strip() + "\n"
 
-def validate_nftables(temp_path: Path) -> None:
-    """Syntax-check the generated nftables rules."""
-    logging.info("Testing nftables syntax...")
+    set allowed_v6_b {{
+        type ipv6_addr
+        flags interval
+        {format_elements_block(v6_b)}
+    }}
+
+    chain whitelist_checker {{
+        ip saddr @allowed_v4_{active} accept
+        ip6 saddr @allowed_v6_{active} accept
+    }}
+
+    chain input {{
+        jump whitelist_checker
+    }}
+}}
+"""
+
+
+# ----------------------------------------------------------------------
+# Nftables Live Operations
+# ----------------------------------------------------------------------
+
+def get_active_suffix() -> str:
+    """
+    Determine which set suffix ('_a' or '_b') is currently active
+    by inspecting the 'whitelist_checker' chain rules.
+    """
     try:
-        subprocess.run(
-            ["nft", "-c", "-f", str(temp_path)],
-            check=True,
+        res = subprocess.run(
+            ["nft", "list", "chain", "inet", "filter", "whitelist_checker"],
             capture_output=True,
             text=True,
+            check=True
         )
-    except subprocess.CalledProcessError as e:
-        logging.error("nftables syntax check failed:\n%s", e.stderr)
-        raise RuntimeError("nftables syntax validation failed") from e
+        if "allowed_v4_b" in res.stdout:
+            return "b"
+    except subprocess.CalledProcessError:
+        pass
+    return "a"  # Default to 'a' if not found or if running for the first time
 
-def apply_nftables() -> None:
-    """Apply nftables configuration to the live system."""
-    logging.info("Applying nftables configuration...")
-    subprocess.run(["nft", "-f", "/etc/nftables.conf"], check=True)
 
-# ----------------------------------------------------------------------
-# Atomic file writing
-# ----------------------------------------------------------------------
+def batch_load_set(set_name: str, elements: List[str]) -> None:
+    """Populate an nftables set in small, safe transactions of CHUNK_SIZE."""
+    # 1. Clear any old data in the target set first
+    subprocess.run(["nft", "flush", "set", "inet", "filter", set_name], check=True)
+
+    # 2. Add elements in sequential chunks
+    total_chunks = (len(elements) + CHUNK_SIZE - 1) // CHUNK_SIZE
+    for idx, chunk in enumerate(chunk_list(elements, CHUNK_SIZE), 1):
+        logging.info("Loading %s: Chunk %d/%d (%d elements)...", set_name, idx, total_chunks, len(chunk))
+        elem_string = ", ".join(chunk)
+        
+        # Inject elements through stdin directly to the nft executable
+        cmd = f"add element inet filter {set_name} {{ {elem_string} }}"
+        subprocess.run(["nft", "-f", "-"], input=cmd, text=True, check=True)
+
 
 def write_atomic_file(content: str, directory: Path) -> Path:
     """Write content atomically to a file under directory and return its Path."""
@@ -176,27 +222,58 @@ def write_atomic_file(content: str, directory: Path) -> Path:
         temp_path = Path(tmp.name)
     return temp_path
 
+
 # ----------------------------------------------------------------------
 # Main entry point
 # ----------------------------------------------------------------------
 
 def main() -> int:
     try:
+        # 1. Fetch, parse and optimize CIDRs
         ipv4, ipv6 = fetch_country_cidrs()
         if not ipv4 and not ipv6:
             logging.warning("No CIDRs fetched, aborting update.")
             return 1
 
-        tmp_path = write_atomic_file(generate_rule_file(ipv4, ipv6), DEST.parent)
-        validate_nftables(tmp_path)
+        # 2. Detect running environment ('a' or 'b')
+        active = get_active_suffix()
+        target = "b" if active == "a" else "a"
+        logging.info("Active set: _%s. Targeting inactive set: _%s for loading.", active, target)
+
+        # 3. Batch load elements into inactive set
+        batch_load_set(f"allowed_v4_{target}", ipv4)
+        batch_load_set(f"allowed_v6_{target}", ipv6)
+
+        # 4. Atomically swap traffic to use the newly populated set
+        logging.info("Performing atomic swap to set _%s...", target)
+        swap_instructions = f"""
+        flush chain inet filter whitelist_checker
+        add rule inet filter whitelist_checker ip saddr @allowed_v4_{target} accept
+        add rule inet filter whitelist_checker ip6 saddr @allowed_v6_{target} accept
+        """
+        subprocess.run(["nft", "-f", "-"], input=swap_instructions, text=True, check=True)
+
+        # 5. Flush the now-inactive set to release system memory
+        logging.info("Cleaning up old active set _%s...", active)
+        cleanup_instructions = f"""
+        flush set inet filter allowed_v4_{active}
+        flush set inet filter allowed_v6_{active}
+        """
+        subprocess.run(["nft", "-f", "-"], input=cleanup_instructions, text=True, check=True)
+
+        # 6. Generate and save the configuration file for persistence on reboots
+        logging.info("Saving active state to %s...", DEST)
+        file_content = generate_whitelist_file(target, ipv4, ipv6)
+        tmp_path = write_atomic_file(file_content, DEST.parent)
         tmp_path.replace(DEST)
-        apply_nftables()
-        logging.info("✅ Whitelist updated successfully.")
+
+        logging.info("✅ Whitelist updated successfully with zero downtime.")
         return 0
 
     except Exception as e:
         logging.exception("❌ Update failed: %s", e)
         return 1
+
 
 if __name__ == "__main__":
     sys.exit(main())
