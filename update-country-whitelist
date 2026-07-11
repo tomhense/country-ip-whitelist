@@ -4,6 +4,10 @@ Fetch IPv4/IPv6 CIDR whitelists for selected countries, collapse overlapping
 subnets to optimize firewall memory/lookup performance, and batch load them
 safely into nftables using an A/B (Blue-Green) swap pattern to prevent
 Netlink buffer space errors and ensure zero network downtime.
+
+This script uses a high-priority pre-filter chain (priority -10) to drop
+unwanted traffic BEFORE it hits the main input chain (priority 0), resolving
+issues where globally accepted ports bypass the whitelist.
 """
 
 import os
@@ -120,12 +124,12 @@ def fetch_country_cidrs() -> Tuple[List[str], List[str]]:
 # ----------------------------------------------------------------------
 
 def format_elements_block(cidr_list: List[str], base_indent: int = 8) -> str:
-    """Return a nicely formatted nftables 'elements = { ... }' block."""
+    """Return a formatted 'elements = { ... }' string or empty string."""
     if not cidr_list:
-        return "elements = {}"
+        return ""
     cidr_indent = base_indent + 4
     inner = ",\n".join(cidr_list)
-    return f"elements = {{\n{indent(inner, ' ' * cidr_indent)}\n{' ' * base_indent}}}"
+    return f"\n{indent('elements = {', ' ' * base_indent)}\n{indent(inner, ' ' * cidr_indent)}\n{indent('}', ' ' * base_indent)}"
 
 
 def generate_whitelist_file(active: str, ipv4: List[str], ipv6: List[str]) -> str:
@@ -140,26 +144,22 @@ def generate_whitelist_file(active: str, ipv4: List[str], ipv6: List[str]) -> st
 table inet filter {{
     set allowed_v4_a {{
         type ipv4_addr
-        flags interval
-        {format_elements_block(v4_a)}
+        flags interval{format_elements_block(v4_a)}
     }}
 
     set allowed_v6_a {{
         type ipv6_addr
-        flags interval
-        {format_elements_block(v6_a)}
+        flags interval{format_elements_block(v6_a)}
     }}
 
     set allowed_v4_b {{
         type ipv4_addr
-        flags interval
-        {format_elements_block(v4_b)}
+        flags interval{format_elements_block(v4_b)}
     }}
 
     set allowed_v6_b {{
         type ipv6_addr
-        flags interval
-        {format_elements_block(v6_b)}
+        flags interval{format_elements_block(v6_b)}
     }}
 
     chain whitelist_checker {{
@@ -167,8 +167,29 @@ table inet filter {{
         ip6 saddr @allowed_v6_{active} accept
     }}
 
-    chain input {{
+    chain whitelist_prefilter {{
+        type filter hook input priority -10;
+        policy accept;
+
+        # 1. Always allow loopback and established connections
+        iifname "lo" accept
+        ct state established,related accept
+
+        # 2. Allow Tailscale interface globally
+        iifname "tailscale0" accept
+
+        # 3. Allow ICMP & IGMP to bypass geo-blocking
+        meta l4proto {{ icmp, ipv6-icmp }} accept
+        ip protocol igmp accept
+
+        # 4. Allow inbound DHCPv6 replies
+        ip6 nexthdr udp udp sport 547 udp dport 546 accept
+
+        # 5. Check whitelist, if matched: pass to main chain (priority 0)
         jump whitelist_checker
+
+        # 6. Drop everything else
+        drop
     }}
 }}
 """
@@ -223,28 +244,60 @@ def write_atomic_file(content: str, directory: Path) -> Path:
     return temp_path
 
 
+def bootstrap_if_needed() -> None:
+    """Ensure the target directory and skeleton file exist, and load them into nftables."""
+    if DEST.exists() and DEST.stat().st_size > 0:
+        return
+
+    logging.info("Dynamic whitelist file missing or empty. Bootstrapping configurations...")
+    
+    # 1. Create directory structures if missing
+    DEST.parent.mkdir(parents=True, exist_ok=True)
+
+    # 2. Write empty skeleton file (Set A active, but empty)
+    skeleton = generate_whitelist_file("a", [], [])
+    tmp_path = write_atomic_file(skeleton, DEST.parent)
+    tmp_path.replace(DEST)
+
+    # 3. Reload main nftables ruleset to apply structures to kernel
+    logging.info("Applying base system nftables ruleset to register dynamic chains...")
+    try:
+        subprocess.run(
+            ["nft", "-f", "/etc/nftables.conf"], 
+            check=True, 
+            capture_output=True, 
+            text=True
+        )
+    except subprocess.CalledProcessError as e:
+        logging.error("Failed to load /etc/nftables.conf: %s", e.stderr)
+        raise RuntimeError("Base nftables initialization failed during bootstrap") from e
+
+
 # ----------------------------------------------------------------------
 # Main entry point
 # ----------------------------------------------------------------------
 
 def main() -> int:
     try:
-        # 1. Fetch, parse and optimize CIDRs
+        # 1. Check and bootstrap directories, skeleton files, and firewall chains
+        bootstrap_if_needed()
+
+        # 2. Fetch, parse and optimize CIDRs
         ipv4, ipv6 = fetch_country_cidrs()
         if not ipv4 and not ipv6:
             logging.warning("No CIDRs fetched, aborting update.")
             return 1
 
-        # 2. Detect running environment ('a' or 'b')
+        # 3. Detect running environment ('a' or 'b')
         active = get_active_suffix()
         target = "b" if active == "a" else "a"
         logging.info("Active set: _%s. Targeting inactive set: _%s for loading.", active, target)
 
-        # 3. Batch load elements into inactive set
+        # 4. Batch load elements into inactive set
         batch_load_set(f"allowed_v4_{target}", ipv4)
         batch_load_set(f"allowed_v6_{target}", ipv6)
 
-        # 4. Atomically swap traffic to use the newly populated set
+        # 5. Atomically swap traffic to use the newly populated set
         logging.info("Performing atomic swap to set _%s...", target)
         swap_instructions = f"""
         flush chain inet filter whitelist_checker
@@ -253,7 +306,7 @@ def main() -> int:
         """
         subprocess.run(["nft", "-f", "-"], input=swap_instructions, text=True, check=True)
 
-        # 5. Flush the now-inactive set to release system memory
+        # 6. Flush the now-inactive set to release system memory
         logging.info("Cleaning up old active set _%s...", active)
         cleanup_instructions = f"""
         flush set inet filter allowed_v4_{active}
@@ -261,7 +314,7 @@ def main() -> int:
         """
         subprocess.run(["nft", "-f", "-"], input=cleanup_instructions, text=True, check=True)
 
-        # 6. Generate and save the configuration file for persistence on reboots
+        # 7. Generate and save the configuration file for persistence on reboots
         logging.info("Saving active state to %s...", DEST)
         file_content = generate_whitelist_file(target, ipv4, ipv6)
         tmp_path = write_atomic_file(file_content, DEST.parent)
