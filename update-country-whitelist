@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
 Fetch IPv4/IPv6 CIDR whitelists for selected countries, collapse overlapping
-subnets to optimize firewall memory/lookup performance, and batch load them
-safely into nftables using an A/B (Blue-Green) swap pattern to prevent
-Netlink buffer space errors and ensure zero network downtime.
+subnets to optimize firewall memory/lookup performance, and load them safely
+into nftables using an A/B (Blue-Green) swap pattern to ensure zero network
+downtime.
 
 This script uses a high-priority pre-filter chain (priority -10) to drop
-unwanted traffic BEFORE it hits the main input chain (priority 0), resolving
-issues where globally accepted ports bypass the whitelist.
+unwanted traffic BEFORE it hits the main input chain (priority 0).
 """
 
 import os
@@ -19,7 +18,7 @@ import subprocess
 import ipaddress
 from pathlib import Path
 from textwrap import indent
-from typing import List, Tuple, Set, Generator
+from typing import List, Tuple, Set
 
 # ----------------------------------------------------------------------
 # Configuration
@@ -33,7 +32,6 @@ BASE_URL: str = (
 
 DEST: Path = Path("/etc/nftables.d/whitelist.nft")
 FETCH_TIMEOUT: int = 20
-CHUNK_SIZE: int = 5000  # Number of elements loaded per transaction
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,12 +42,6 @@ logging.basicConfig(
 # ----------------------------------------------------------------------
 # Helper Functions
 # ----------------------------------------------------------------------
-
-def chunk_list(lst: List[str], chunk_size: int) -> Generator[List[str], None, None]:
-    """Yield successive chunks from lst."""
-    for i in range(0, len(lst), chunk_size):
-        yield lst[i : i + chunk_size]
-
 
 def parse_cidr_lines(lines: List[str]) -> Tuple[Set[ipaddress.IPv4Network], Set[ipaddress.IPv6Network]]:
     """
@@ -218,20 +210,21 @@ def get_active_suffix() -> str:
     return "a"  # Default to 'a' if not found or if running for the first time
 
 
-def batch_load_set(set_name: str, elements: List[str]) -> None:
-    """Populate an nftables set in small, safe transactions of CHUNK_SIZE."""
+def load_set(set_name: str, elements: List[str]) -> None:
+    """Populate an nftables set in a single, safe transaction."""
     # 1. Clear any old data in the target set first
     subprocess.run(["nft", "flush", "set", "inet", "filter", set_name], check=True)
 
-    # 2. Add elements in sequential chunks
-    total_chunks = (len(elements) + CHUNK_SIZE - 1) // CHUNK_SIZE
-    for idx, chunk in enumerate(chunk_list(elements, CHUNK_SIZE), 1):
-        logging.info("Loading %s: Chunk %d/%d (%d elements)...", set_name, idx, total_chunks, len(chunk))
-        elem_string = ", ".join(chunk)
-        
-        # Inject elements through stdin directly to the nft executable
-        cmd = f"add element inet filter {set_name} {{ {elem_string} }}"
-        subprocess.run(["nft", "-f", "-"], input=cmd, text=True, check=True)
+    if not elements:
+        return
+
+    # 2. Add all elements in one command
+    logging.info("Loading %s (%d elements)...", set_name, len(elements))
+    elem_string = ", ".join(elements)
+    
+    # Inject elements through stdin directly to the nft executable
+    cmd = f"add element inet filter {set_name} {{ {elem_string} }}"
+    subprocess.run(["nft", "-f", "-"], input=cmd, text=True, check=True)
 
 
 def write_atomic_file(content: str, directory: Path) -> Path:
@@ -293,9 +286,9 @@ def main() -> int:
         target = "b" if active == "a" else "a"
         logging.info("Active set: _%s. Targeting inactive set: _%s for loading.", active, target)
 
-        # 4. Batch load elements into inactive set
-        batch_load_set(f"allowed_v4_{target}", ipv4)
-        batch_load_set(f"allowed_v6_{target}", ipv6)
+        # 4. Load elements into inactive set
+        load_set(f"allowed_v4_{target}", ipv4)
+        load_set(f"allowed_v6_{target}", ipv6)
 
         # 5. Atomically swap traffic to use the newly populated set
         logging.info("Performing atomic swap to set _%s...", target)
